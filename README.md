@@ -16,18 +16,25 @@ Comments are keyed on author + timestamp, so they also survive renames.
 
 ## Slack app setup
 
-1. Create an app at api.slack.com/apps, add bot scopes `chat:write` and `reactions:write`, install it.
-2. Invite the bot to `#tarb-tickets` and grab the channel ID.
+1. Go to https://api.slack.com/apps → **Create New App** → **From scratch**. Name it, and pick the workspace that has `#tarb-tickets`. The token is tied to this workspace.
+2. **OAuth & Permissions** → **Bot Token Scopes** → add `chat:write` and `reactions:write`.
+3. **Install to Workspace** (a workspace admin may need to approve). Copy the **Bot User OAuth Token** (`xoxb-…`).
+4. In Slack, open `#tarb-tickets`, type `/invite @your-app-name`.
+5. Channel ID: right-click the channel → **View channel details**; the ID (`C…`) is at the bottom.
+6. Optional workspace ID (`T…`): the bot logs it on startup, so the easiest way is to run it once and copy it from the log.
 
 ## Running
 
 ```sh
 pip install -r requirements.txt
-export SLACK_BOT_TOKEN=xoxb-...
-export SLACK_CHANNEL_ID=C0123456789
+cp .env.example .env             # then fill in the token and channel ID
 python tarb_bot.py --once -v     # single poll; good first check
 python tarb_bot.py               # long-running, polls every 60s
 ```
+
+Settings are read from `.env` (next to the script or in the working directory); real environment variables take precedence. `.env` is git-ignored.
+
+On startup the bot logs which workspace and bot user the token belongs to. If `SLACK_TEAM_ID` is set and doesn't match, it refuses to run.
 
 Polling is cheap: each cycle is one `prop=info` request, and the full DiscussionTools parse only runs when the page's revision ID changes.
 
@@ -35,6 +42,7 @@ Polling is cheap: each cycle is one `prop=info` request, and the full Discussion
 
 | Variable | Default |
 |---|---|
+| `SLACK_TEAM_ID` | unset (no workspace check) |
 | `TARB_MAINTAINERS` | `Harej,Cyberpower678,GreenC` |
 | `TARB_REACTION` | `white_check_mark` |
 | `TARB_POLL_INTERVAL` | `60` (seconds) |

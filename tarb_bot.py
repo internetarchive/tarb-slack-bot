@@ -53,6 +53,7 @@ class Config:
     db_path: str = "tarb_bot.sqlite3"
     poll_interval: int = 60
     user_agent: str = "tarb-bot/1.0 (Slack mirror of User talk:InternetArchiveBot)"
+    slack_team_id: Optional[str] = None  # if set, refuse to run against any other workspace
 
     @property
     def wiki_base(self) -> str:
@@ -75,6 +76,7 @@ class Config:
             db_path=os.environ.get("TARB_DB_PATH", cls.db_path),
             poll_interval=int(os.environ.get("TARB_POLL_INTERVAL", cls.poll_interval)),
             user_agent=os.environ.get("TARB_USER_AGENT", cls.user_agent),
+            slack_team_id=os.environ.get("SLACK_TEAM_ID") or None,
         )
 
 
@@ -517,6 +519,19 @@ class TarbBot:
 # CLI
 # --------------------------------------------------------------------------
 
+def check_workspace(client: WebClient, cfg: Config) -> None:
+    """Confirm the token works and belongs to the intended Slack workspace."""
+    try:
+        auth = client.auth_test()
+    except SlackApiError as e:
+        sys.exit(f"Slack rejected the token: {e.response.get('error')}")
+    log.info("Connected to Slack workspace %r (%s) as %s; posting to channel %s",
+             auth.get("team"), auth.get("team_id"), auth.get("user"), cfg.slack_channel)
+    if cfg.slack_team_id and auth.get("team_id") != cfg.slack_team_id:
+        sys.exit(f"Token belongs to workspace {auth.get('team_id')} ({auth.get('team')}), "
+                 f"but SLACK_TEAM_ID is {cfg.slack_team_id}. Refusing to run.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--once", action="store_true", help="run a single poll and exit (for cron)")
@@ -529,9 +544,17 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
+    try:  # pick up settings from a .env file next to the script or in the working directory
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+        load_dotenv()
+    except ImportError:
+        pass
+
     cfg = Config.from_env()
     client = WebClient(token=cfg.slack_token)
     client.retry_handlers.append(RateLimitErrorRetryHandler(max_retry_count=5))
+    check_workspace(client, cfg)
     bot = TarbBot(cfg, WikiClient(cfg), Slack(client, cfg.slack_channel), Store(cfg.db_path))
 
     while True:
