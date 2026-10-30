@@ -42,7 +42,13 @@ class FakeSlack:
         self.updates.append((ts, text))
 
     def set_reaction(self, ts, name, on):
-        self.reactions[ts] = on
+        if on:
+            self.reactions.setdefault(ts, set()).add(name)
+        else:
+            self.reactions.get(ts, set()).discard(name)
+
+    def reacts(self, ts):
+        return self.reactions.get(ts, set())
 
     def thread(self, ts):
         return [t for (_, parent, t) in self.posts if parent == ts]
@@ -54,7 +60,8 @@ class FakeSlack:
 class BotTest(unittest.TestCase):
     def setUp(self):
         self.cfg = Config(slack_token="x", slack_channel="C1",
-                          maintainers=frozenset(map(norm_user, ["Harej", "Cyberpower678", "GreenC"])))
+                          maintainers=frozenset(map(norm_user, ["Harej", "Cyberpower678", "GreenC"])),
+                          slack_users={"Cyberpower678": "U0CYBER", "GreenC": "U0GREEN"})
         self.wiki, self.slack = FakeWiki(), FakeSlack()
         self.bot = TarbBot(self.cfg, self.wiki, self.slack, Store(":memory:"))
 
@@ -79,25 +86,75 @@ class BotTest(unittest.TestCase):
         (ts, parent_text), = self.slack.parents()
         self.assertIn("Broken links", parent_text)
         self.assertEqual(self.slack.thread(ts), [])  # opening comment isn't duplicated
-        self.assertNotIn(ts, self.slack.reactions)
+        self.assertEqual(self.slack.reacts(ts), set())
 
-        # Maintainer replies -> completed, no thread post
+        # Non-maintainer comment before any response: thread post, no reaction, no ping
+        c1["replies"].append(comment("Bob", "20261028103000", "Same here"))
+        self.run_bot([sec])
+        self.assertEqual(self.slack.reacts(ts), set())
+        self.assertNotIn("<@", self.slack.thread(ts)[-1])
+
+        # Maintainer replies -> check mark, no thread post
         c1["replies"].append(comment("Cyberpower678", "20261028110000", "Fixed"))
         self.run_bot([sec])
-        self.assertTrue(self.slack.reactions[ts])
-        self.assertEqual(self.slack.thread(ts), [])
-
-        # Someone else follows up -> reaction removed, thread post
-        c1["replies"][0]["replies"].append(comment("Alice", "20261028120000", "Not fixed"))
-        self.run_bot([sec])
-        self.assertFalse(self.slack.reactions[ts])
+        self.assertEqual(self.slack.reacts(ts), {"white_check_mark"})
         self.assertEqual(len(self.slack.thread(ts)), 1)
-        self.assertIn("Not fixed", self.slack.thread(ts)[0])
 
-        # Maintainer again (underscore form of name) -> completed again
+        # Follow-up -> point_up, thread post that pings Cyberpower678
+        c1["replies"][1]["replies"].append(comment("Alice", "20261028120000", "Not fixed"))
+        self.run_bot([sec])
+        self.assertEqual(self.slack.reacts(ts), {"point_up"})
+        last = self.slack.thread(ts)[-1]
+        self.assertIn("Not fixed", last)
+        self.assertTrue(last.startswith("<@U0CYBER>"))
+
+        # A second follow-up before anyone responds: posted, but no second ping
+        c1["replies"].append(comment("Bob", "20261028121000", "Me neither"))
+        self.run_bot([sec])
+        self.assertEqual(self.slack.reacts(ts), {"point_up"})
+        self.assertNotIn("<@", self.slack.thread(ts)[-1])
+
+        # A different maintainer responds -> back to check mark
         c1["replies"].append(comment("GreenC", "20261028130000", "Really fixed"))
         self.run_bot([sec])
-        self.assertTrue(self.slack.reactions[ts])
+        self.assertEqual(self.slack.reacts(ts), {"white_check_mark"})
+
+        # Next follow-up pings GreenC, the most recent responder
+        c1["replies"].append(comment("Alice", "20261028140000", "Thanks, one more thing"))
+        self.run_bot([sec])
+        self.assertTrue(self.slack.thread(ts)[-1].startswith("<@U0GREEN>"))
+
+    def test_unmapped_maintainer_named_in_bold(self):
+        self.run_bot([])
+        c1 = comment("Alice", "20261028100000")
+        sec = heading("Q", "Alice", "20261028100000", [c1])
+        self.run_bot([sec])
+        c1["replies"].append(comment("Harej", "20261028110000"))
+        self.run_bot([sec])
+        c1["replies"][0]["replies"].append(comment("Alice", "20261028120000"))
+        self.run_bot([sec])
+        (ts, _), = self.slack.parents()
+        self.assertTrue(self.slack.thread(ts)[-1].startswith("*Harej*"))
+
+    def test_seeded_section_follow_up_creates_post_with_point_up(self):
+        c1 = comment("Alice", "20261001000000", replies=[comment("GreenC", "20261002000000")])
+        sec = heading("Old", "Alice", "20261001000000", [c1])
+        self.run_bot([sec])  # quiet seed, state DONE
+        c1["replies"].append(comment("Alice", "20261003000000", "back again"))
+        self.run_bot([sec])
+        (ts, _), = self.slack.parents()
+        self.assertEqual(self.slack.reacts(ts), {"point_up"})
+        self.assertTrue(self.slack.thread(ts)[-1].startswith("<@U0GREEN>"))
+
+    def test_migrates_old_database(self):
+        import sqlite3, tempfile, os
+        path = os.path.join(tempfile.mkdtemp(), "old.sqlite3")
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE sections (key TEXT PRIMARY KEY, title TEXT NOT NULL, slack_ts TEXT, "
+                   "completed INTEGER NOT NULL DEFAULT 0, present INTEGER NOT NULL DEFAULT 1, "
+                   "first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        db.commit(); db.close()
+        Store(path).update_section("x", responder="Harej")  # no error -> column exists
 
     def test_rename_does_not_create_new_post(self):
         self.run_bot([])

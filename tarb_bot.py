@@ -5,8 +5,11 @@ tarb-bot: mirror sections of User_talk:InternetArchiveBot into a Slack channel.
 - One top-level Slack message per talk page section.
 - When a maintainer (Harej, Cyberpower678, GreenC by default) has the latest
   comment in a section, the message gets the :white_check_mark: reaction.
-- When anyone else comments afterwards, the reaction is removed and the new
-  comment is posted into the message's thread.
+- When anyone else comments after a maintainer's response, the reaction becomes
+  :point_up:, the comment is posted into the thread, and the maintainer who
+  responded is pinged. Once a maintainer replies, it goes back to
+  :white_check_mark:.
+- Other comments are posted into the thread as they arrive.
 
 Section identity is rename-proof: sections are keyed on the DiscussionTools
 heading "name" (h-<first author>-<first timestamp>), which does not depend on
@@ -37,6 +40,9 @@ log = logging.getLogger("tarb-bot")
 
 DEFAULT_MAINTAINERS = "Harej,Cyberpower678,GreenC"
 
+# Section states (stored in sections.completed for backward compatibility)
+OPEN, DONE, FOLLOWUP = 0, 1, 2
+
 
 # --------------------------------------------------------------------------
 # Config
@@ -48,6 +54,8 @@ class Config:
     slack_channel: str
     maintainers: frozenset
     reaction: str = "white_check_mark"
+    followup_reaction: str = "point_up"
+    slack_users: dict = field(default_factory=dict)  # normalised wiki username -> Slack member ID
     api_url: str = "https://meta.wikimedia.org/w/api.php"
     page: str = "User talk:InternetArchiveBot"
     db_path: str = "tarb_bot.sqlite3"
@@ -66,11 +74,23 @@ class Config:
         if missing:
             sys.exit(f"Missing required environment variables: {', '.join(missing)}")
         maint = os.environ.get("TARB_MAINTAINERS", DEFAULT_MAINTAINERS)
+        slack_users = {}
+        for pair in os.environ.get("TARB_SLACK_USERS", "").split(","):
+            if not pair.strip():
+                continue
+            wiki_user, sep, member_id = pair.partition("=")
+            member_id = member_id.strip()
+            if not sep or not re.fullmatch(r"[UW][A-Z0-9]+", member_id):
+                sys.exit(f"TARB_SLACK_USERS entry {pair.strip()!r} should look like WikiName=U0123ABCD "
+                         "(a Slack member ID, not a display name)")
+            slack_users[norm_user(wiki_user)] = member_id
         return cls(
             slack_token=os.environ["SLACK_BOT_TOKEN"],
             slack_channel=os.environ["SLACK_CHANNEL_ID"],
             maintainers=frozenset(norm_user(u) for u in maint.split(",") if u.strip()),
             reaction=os.environ.get("TARB_REACTION", "white_check_mark").strip(":"),
+            followup_reaction=os.environ.get("TARB_FOLLOWUP_REACTION", "point_up").strip(":"),
+            slack_users=slack_users,
             api_url=os.environ.get("TARB_API_URL", cls.api_url),
             page=os.environ.get("TARB_PAGE", cls.page),
             db_path=os.environ.get("TARB_DB_PATH", cls.db_path),
@@ -286,6 +306,10 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
         """)
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(sections)")}
+        if "responder" not in cols:  # added in v1.1
+            with self.db:
+                self.db.execute("ALTER TABLE sections ADD COLUMN responder TEXT")
 
     def get_meta(self, k: str) -> Optional[str]:
         row = self.db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
@@ -389,6 +413,29 @@ class TarbBot:
     def is_maintainer(self, user: str) -> bool:
         return norm_user(user) in self.cfg.maintainers
 
+    def mention(self, wiki_user: str) -> str:
+        member_id = self.cfg.slack_users.get(norm_user(wiki_user))
+        return f"<@{member_id}>" if member_id else f"*{slack_escape(wiki_user)}*"
+
+    def desired_state(self, s: Section) -> tuple[int, Optional[str]]:
+        """Derive the state purely from the page, so it self-corrects.
+        Returns (state, maintainer whose response it concerns)."""
+        responses = [c for c in s.comments if self.is_maintainer(c.author)]
+        if not responses:
+            return OPEN, None
+        if self.is_maintainer(s.latest.author):
+            return DONE, s.latest.author
+        return FOLLOWUP, responses[-1].author
+
+    def _swap_reactions(self, ts: str, old: int, new: int) -> None:
+        names = {DONE: self.cfg.reaction, FOLLOWUP: self.cfg.followup_reaction}
+        if old == new:
+            return
+        if old in names:
+            self.slack.set_reaction(ts, names[old], False)
+        if new in names:
+            self.slack.set_reaction(ts, names[new], True)
+
     # --- main entry points ---
 
     def run_once(self, force: bool = False, post_existing: bool = False) -> None:
@@ -451,7 +498,8 @@ class TarbBot:
             self.store.insert_section(s.key, s.title, None)
             for c in s.comments:
                 self.store.add_comment(s.key, c)
-            self.store.update_section(s.key, completed=int(self.is_maintainer(s.latest.author)))
+            state, responder = self.desired_state(s)
+            self.store.update_section(s.key, completed=state, responder=responder)
 
     def _match_vanished(self, s: Section, vanished: list[str]) -> Optional[str]:
         new_keys = {c.key for c in s.comments}
@@ -488,31 +536,36 @@ class TarbBot:
 
         seen = self.store.comment_keys(s.key)
         new = [c for c in s.comments if c.key not in seen]
-        if not new:
+        want, responder = self.desired_state(s)
+        old = row["completed"]
+        if not new and want == old:
             return
 
         ts = row["slack_ts"]
-        if not ts:  # seeded quietly on first run; create the post now that there's activity
+        had_post = bool(ts)
+        if not ts:
+            if not new:  # quietly-seeded section whose state changed without new comments
+                self.store.update_section(s.key, completed=want, responder=responder)
+                return
             ts = self.slack.post(self._parent_text(s))
             self.store.update_section(s.key, slack_ts=ts)
 
-        # Desired state: completed iff the most recent comment is from a maintainer.
-        want = self.is_maintainer(s.latest.author)
-        have = bool(row["completed"]) and bool(row["slack_ts"])
-        if not want and have:
-            self.slack.set_reaction(ts, self.cfg.reaction, False)
-            self.store.update_section(s.key, completed=0)
+        # Reactions: OPEN = none, DONE = completed, FOLLOWUP = follow-up.
+        self._swap_reactions(ts, old if had_post else OPEN, want)
+        self.store.update_section(s.key, completed=want, responder=responder)
+
+        # Ping the responding maintainer on the first follow-up after their response.
+        ping = want == FOLLOWUP and old != FOLLOWUP and bool(new)
+        last_response_ts = max((c.ts for c in s.comments if self.is_maintainer(c.author)), default="")
 
         for c in new:
             if c.key not in shown_in_parent and not self.is_maintainer(c.author):
-                self.slack.post(self._reply_text(c), thread_ts=ts)
+                text = self._reply_text(c)
+                if ping and c.ts >= last_response_ts:
+                    text = f"{self.mention(responder)} there's a follow-up after your response.\n{text}"
+                    ping = False
+                self.slack.post(text, thread_ts=ts)
             self.store.add_comment(s.key, c)  # record per comment so a crash can't double-post
-
-        if want and not have:
-            self.slack.set_reaction(ts, self.cfg.reaction, True)
-            self.store.update_section(s.key, completed=1)
-        elif not want:
-            self.store.update_section(s.key, completed=0)
 
 
 # --------------------------------------------------------------------------

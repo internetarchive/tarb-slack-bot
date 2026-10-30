@@ -4,7 +4,9 @@ Mirrors sections of [User talk:InternetArchiveBot](https://meta.wikimedia.org/wi
 
 - **New section** → new top-level message (title link, opener, excerpt of the first comment).
 - **Maintainer has the latest comment** (Harej, Cyberpower678, GreenC) → `:white_check_mark:` reaction.
-- **Anyone else comments after that** → reaction removed, comment posted in the thread.
+- **Anyone else comments after a maintainer's response** → `:white_check_mark:` becomes `:point_up:`, the comment is posted in the thread, and the maintainer who responded is pinged. Further follow-ups are posted without a second ping.
+- **A maintainer replies again** → `:point_up:` goes back to `:white_check_mark:`.
+- **Comments before any maintainer has responded** → posted in the thread, no reaction.
 - **Section renamed** → parent message edited in place, rename noted in the thread. No new post.
 - **Section archived/removed** → note in the thread. If it comes back, that's noted too.
 
@@ -21,7 +23,20 @@ Comments are keyed on author + timestamp, so they also survive renames.
 3. **Install to Workspace** (a workspace admin may need to approve). Copy the **Bot User OAuth Token** (`xoxb-…`).
 4. In Slack, open `#tarb-tickets`, type `/invite @your-app-name`.
 5. Channel ID: right-click the channel → **View channel details**; the ID (`C…`) is at the bottom.
-6. Optional workspace ID (`T…`): the bot logs it on startup, so the easiest way is to run it once and copy it from the log.
+6. Slack member IDs for the maintainers (for pings): see below.
+7. Optional workspace ID (`T…`): the bot logs it on startup, so the easiest way is to run it once and copy it from the log.
+
+## Mapping wiki usernames to Slack users
+
+Pings use Slack **member IDs** (`U…`), not display names or usernames, because those can change and aren't unique. To get one: click the person's name or avatar in Slack → **View full profile** → the **⋮** (More) button → **Copy member ID**.
+
+Then list them in `.env`, keyed by wiki username:
+
+```
+TARB_SLACK_USERS=Harej=U0123ABCD,Cyberpower678=U0456EFGH,GreenC=U0789IJKL
+```
+
+A maintainer with no mapping is named in bold instead of pinged.
 
 ## Running
 
@@ -45,6 +60,8 @@ Polling is cheap: each cycle is one `prop=info` request, and the full Discussion
 | `SLACK_TEAM_ID` | unset (no workspace check) |
 | `TARB_MAINTAINERS` | `Harej,Cyberpower678,GreenC` |
 | `TARB_REACTION` | `white_check_mark` |
+| `TARB_FOLLOWUP_REACTION` | `point_up` |
+| `TARB_SLACK_USERS` | unset (maintainers named, not pinged) |
 | `TARB_POLL_INTERVAL` | `60` (seconds) |
 | `TARB_DB_PATH` | `tarb_bot.sqlite3` |
 | `TARB_PAGE` | `User talk:InternetArchiveBot` |
